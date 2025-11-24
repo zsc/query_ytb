@@ -1,316 +1,727 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-简单的 YouTube 元数据爬取脚本：
-- 只使用 YouTube Data API v3
-- 只抓视频 URL 和 meta 信息，不下载视频
-- 支持从文本文件读取多条查询语句
-- 自动分页 + 去重 + 导出 CSV
+youtube_metadata_scraper.py
 
-使用方法：
-    python youtube_metadata_scraper.py \
-        --queries_file queries.txt \
-        --output_csv youtube_metadata.csv \
-        --max_per_query 200
+从一个关键词列表（txt）中，通过 YouTube Data API v3 尽可能多地挖掘频道 ID，
+并写出到一个 channel_list.txt（或你指定文件），
+在设计上尽量提高「每 100 quota 对应的新频道数」。
 
-环境变量：
-    需要先设置 YT_API_KEY
+核心特性：
+- 使用 search.list(type=channel, maxResults=50) 搜索频道
+- 对每个关键词自适应决定是否翻页（根据“新频道占比 new_ratio”）
+- 全局 quota 预算控制，防止超限
+- 去重后的 channelId 输出为 txt
+- 可选：对高收益关键词再用 type=video 搜索，从视频结果中挖更多频道（默认关闭）
+- 支持 --dry-run 模式，不消耗真实 Quota，仅模拟流程。
+
+依赖：
+- Python 3.7+
+- requests   （pip install requests）
+
+用法示例：
+    export YT_API_KEY="你的 YouTube API Key"
+    
+    # 真实运行
+    python3 youtube_metadata_scraper.py \
+        --keywords keywords.txt \
+        --output channels.txt \
+        --daily-quota 9000
+        
+    # 模拟运行（测试逻辑，不消耗 API）
+    python3 youtube_metadata_scraper.py \
+        --keywords keywords.txt \
+        --dry-run --log-level DEBUG
+
 """
 
-import os
-import csv
-import time
 import argparse
 import logging
-from typing import List, Dict, Set, Optional
+import os
+import sys
+import time
+import random
+import string
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import requests
 
-# ===================== 配置区 =====================
-
-YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
-YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
-
-# 每次 search.list 的最大返回数（API 限制 50）
-SEARCH_PAGE_SIZE = 50
-
-# 每次 videos.list 最多 50 个 ID
-VIDEO_BATCH_SIZE = 50
-
-# 为了避免触发配额/速率限制，可以适当 sleep
-REQUEST_SLEEP_SECONDS = 0.1
+YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
+SEARCH_QUOTA_COST = 100  # search.list 一次调用固定 100 quota 单位（官方文档）
+CHANNELS_LIST_QUOTA_COST = 1  # channels.list 一次调用 1 quota 单位（仅用于可选过滤）
 
 
-# ===================== 工具函数 =====================
+class QuotaManager:
+    """简单的配额管理器，在脚本内部追踪剩余 quota。"""
 
-def get_api_key() -> str:
-    api_key = os.environ.get("YT_API_KEY")
-    if not api_key:
-        raise RuntimeError("环境变量 YT_API_KEY 未设置，请先 export YT_API_KEY=你的key")
-    return api_key
+    def __init__(self, daily_quota: int):
+        self.daily_quota = daily_quota
+        self.remaining = daily_quota
+
+    def consume(self, amount: int) -> bool:
+        """尝试消耗 amount 个 quota。成功返回 True，配额不足返回 False。"""
+        if self.remaining < amount:
+            logging.warning(
+                "Quota not enough: need %d, remaining %d", amount, self.remaining
+            )
+            return False
+        self.remaining -= amount
+        return True
+
+    def __str__(self) -> str:
+        return f"Quota(remaining={self.remaining}, daily={self.daily_quota})"
 
 
-def load_queries_from_file(path: str) -> List[str]:
-    queries = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            q = line.strip()
-            if q:
-                queries.append(q)
-    return queries
+class YouTubeAPI:
+    """YouTube Data API v3 的简单封装。"""
 
+    def __init__(
+        self,
+        api_key: str,
+        quota_manager: QuotaManager,
+        http_timeout: int = 10,
+        max_retries: int = 3,
+        retry_backoff: float = 1.5,
+        dry_run: bool = False,
+    ):
+        self.api_key = api_key
+        self.quota = quota_manager
+        self.http_timeout = http_timeout
+        self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
+        self.dry_run = dry_run
 
-def youtube_search_query(
-    api_key: str,
-    query: str,
-    max_results: int,
-    video_duration: str = "any",
-    region_code: Optional[str] = None
-) -> List[str]:
-    """
-    调用 search.list，获取满足 query 的视频 ID 列表。
-    - max_results: 这个 query 总共最多获取多少个结果
-    - video_duration: "any" / "short" / "medium" / "long"
-    - region_code: 如 "US", "JP" 等，选填
-    """
-    collected_ids: List[str] = []
-    next_page_token = None
+    # ---------- HTTP 基础调用 ----------
 
-    logging.info(f"开始搜索: '{query}', 目标条数={max_results}")
+    def _request(
+        self,
+        endpoint: str,
+        params: Dict[str, str],
+        quota_cost: int,
+        desc: str = "",
+    ) -> Optional[Dict]:
+        """
+        通用 GET 请求包装，带简单的重试 & quota 检查。
 
-    while True:
-        if len(collected_ids) >= max_results:
-            break
+        :param endpoint: 比如 "search" 或 "videos"
+        :param params: query 参数字典
+        :param quota_cost: 本次调用的 quota 消耗
+        :param desc: 日志描述（可选）
+        :return: JSON dict 或 None（出错时）
+        """
+        # 1. 检查 Quota
+        if not self.quota.consume(quota_cost):
+            logging.error("Quota exhausted before calling %s", desc or endpoint)
+            return None
 
+        # 2. Dry Run 处理
+        if self.dry_run:
+            logging.info("[DRY-RUN] Would request '%s' (cost %d quota)", desc or endpoint, quota_cost)
+            return self._generate_mock_response(endpoint, params)
+
+        # 3. 真实请求逻辑
+        url = f"{YOUTUBE_API_BASE}/{endpoint}"
+        params = dict(params)
+        params["key"] = self.api_key
+
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                resp = requests.get(url, params=params, timeout=self.http_timeout)
+                if resp.status_code == 200:
+                    return resp.json()
+
+                # 简单的限流/服务器错误处理
+                if resp.status_code in (500, 502, 503, 504):
+                    logging.warning(
+                        "[%s] Server error %s, attempt %d/%d",
+                        desc or endpoint,
+                        resp.status_code,
+                        attempt,
+                        self.max_retries,
+                    )
+                else:
+                    logging.error(
+                        "[%s] HTTP error %s: %s",
+                        desc or endpoint,
+                        resp.status_code,
+                        resp.text,
+                    )
+                    break  # 非 5xx，就不要重试了
+            except requests.RequestException as e:
+                logging.warning(
+                    "[%s] Request exception on attempt %d/%d: %s",
+                    desc or endpoint,
+                    attempt,
+                    self.max_retries,
+                    e,
+                )
+
+            if attempt < self.max_retries:
+                time.sleep(self.retry_backoff * attempt)
+
+        # 到这里说明失败了退还本次预扣的 quota
+        self.quota.remaining += quota_cost
+        logging.error(
+            "[%s] Request failed after %d attempts, quota rolled back.",
+            desc or endpoint,
+            self.max_retries,
+        )
+        return None
+
+    def _generate_mock_response(self, endpoint: str, params: Dict[str, str]) -> Dict:
+        """
+        为 Dry Run 模式生成假的 API 响应数据。
+        生成随机 ID 以模拟发现了新频道。
+        """
+        time.sleep(0.1)  # 模拟一点点延迟
+        
+        if endpoint == "search":
+            # 模拟 search.list 响应
+            max_results = int(params.get("maxResults", 50))
+            search_type = params.get("type", "channel")
+            items = []
+            
+            for _ in range(max_results):
+                # 生成一个随机 Channel ID
+                rand_suffix = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
+                fake_channel_id = f"UC_MOCK_{rand_suffix}"
+                
+                item = {
+                    "kind": f"youtube#{search_type}",
+                    "etag": "mock_etag",
+                    "snippet": {
+                        "channelId": fake_channel_id,
+                        "title": f"Mock Channel {fake_channel_id}",
+                        "description": "This is a mock channel for dry-run."
+                    }
+                }
+                
+                # 结构差异：type=channel 时 ID 在 id 对象里，type=video 时 ID 在 snippet 里
+                if search_type == "channel":
+                    item["id"] = {"kind": "youtube#channel", "channelId": fake_channel_id}
+                elif search_type == "video":
+                    item["id"] = {"kind": "youtube#video", "videoId": f"VIDEO_{rand_suffix}"}
+                
+                items.append(item)
+
+            return {
+                "kind": "youtube#searchListResponse",
+                "etag": "mock_response_etag",
+                "nextPageToken": "mock_next_page_token_ABC123", # 总是返回下一页 token 以测试翻页逻辑
+                "pageInfo": {"totalResults": 10000, "resultsPerPage": max_results},
+                "items": items
+            }
+            
+        elif endpoint == "channels":
+            # 模拟 channels.list 响应
+            requested_ids = params.get("id", "").split(",")
+            items = []
+            for cid in requested_ids:
+                items.append({
+                    "kind": "youtube#channel",
+                    "id": cid,
+                    "snippet": {"title": "Mock Detail"},
+                    "statistics": {"viewCount": "1000", "subscriberCount": "500"}
+                })
+            return {
+                "kind": "youtube#channelListResponse",
+                "items": items
+            }
+            
+        return {}
+
+    # ---------- 具体 API ----------
+
+    def search_channels(
+        self,
+        keyword: str,
+        max_results: int = 50,
+        page_token: Optional[str] = None,
+        order: str = "relevance",
+    ) -> Optional[Dict]:
+        """
+        search.list 搜索频道（type=channel）。
+        """
         params = {
-            "key": api_key,
             "part": "snippet",
-            "q": query,
-            "type": "video",
-            "maxResults": min(SEARCH_PAGE_SIZE, max_results - len(collected_ids)),
-            "videoDuration": video_duration,
-            "order": "relevance",
+            "q": keyword,
+            "type": "channel",
+            "maxResults": str(max_results),
+            "order": order,
         }
-        if region_code:
-            params["regionCode"] = region_code
-        if next_page_token:
-            params["pageToken"] = next_page_token
+        if page_token:
+            params["pageToken"] = page_token
 
-        resp = requests.get(YOUTUBE_SEARCH_URL, params=params, timeout=10)
-        if resp.status_code != 200:
-            logging.error(f"search.list 请求失败: {resp.status_code} {resp.text}")
-            break
-
-        data = resp.json()
-        items = data.get("items", [])
-        if not items:
-            break
-
-        # 收集 videoId
-        for item in items:
-            video_id = item["id"]["videoId"]
-            collected_ids.append(video_id)
-
-        next_page_token = data.get("nextPageToken")
-        if not next_page_token:
-            break
-
-        time.sleep(REQUEST_SLEEP_SECONDS)
-
-    logging.info(f"搜索 '{query}' 完成，获得 {len(collected_ids)} 个 videoId")
-    return collected_ids
-
-
-def youtube_get_videos_details(api_key: str, video_ids: List[str]) -> List[Dict]:
-    """
-    调用 videos.list，批量获取 video 的 meta 信息。
-    返回一个包含字典的列表，每个字典对应一个视频。
-    """
-    results: List[Dict] = []
-    for i in range(0, len(video_ids), VIDEO_BATCH_SIZE):
-        batch_ids = video_ids[i:i + VIDEO_BATCH_SIZE]
-        params = {
-            "key": api_key,
-            "part": "snippet,contentDetails,statistics",
-            "id": ",".join(batch_ids),
-            "maxResults": len(batch_ids),
-        }
-
-        resp = requests.get(YOUTUBE_VIDEOS_URL, params=params, timeout=10)
-        if resp.status_code != 200:
-            logging.error(f"videos.list 请求失败: {resp.status_code} {resp.text}")
-            continue
-
-        data = resp.json()
-        items = data.get("items", [])
-        for item in items:
-            results.append(item)
-
-        time.sleep(REQUEST_SLEEP_SECONDS)
-
-    return results
-
-
-def iso8601_duration_to_seconds(duration: str) -> int:
-    """
-    将 ISO8601 时长（如 'PT1H2M3S'）转为秒数。
-    简易实现，只覆盖 PT..H..M..S 三种单位，够用。
-    """
-    if not duration.startswith("PT"):
-        return 0
-    duration = duration[2:]
-
-    hours = minutes = seconds = 0
-    num = ""
-    for ch in duration:
-        if ch.isdigit():
-            num += ch
-        else:
-            if ch == "H":
-                hours = int(num)
-            elif ch == "M":
-                minutes = int(num)
-            elif ch == "S":
-                seconds = int(num)
-            num = ""
-    return hours * 3600 + minutes * 60 + seconds
-
-
-def flatten_video_item(item: Dict) -> Dict:
-    """
-    把 videos.list 返回的复 json，抽成一个扁平 dict。
-    方便后面写入 CSV。
-    """
-    video_id = item.get("id", "")
-    snippet = item.get("snippet", {}) or {}
-    content = item.get("contentDetails", {}) or {}
-    stats = item.get("statistics", {}) or {}
-
-    duration_iso = content.get("duration", "")
-    duration_seconds = iso8601_duration_to_seconds(duration_iso)
-
-    return {
-        "video_id": video_id,
-        "video_url": f"https://www.youtube.com/watch?v={video_id}",
-        "title": snippet.get("title", ""),
-        "description": snippet.get("description", "").replace("\n", " ").strip(),
-        "channel_id": snippet.get("channelId", ""),
-        "channel_title": snippet.get("channelTitle", ""),
-        "published_at": snippet.get("publishedAt", ""),
-        "duration_iso8601": duration_iso,
-        "duration_seconds": duration_seconds,
-        "view_count": stats.get("viewCount", ""),
-        "like_count": stats.get("likeCount", ""),
-        "comment_count": stats.get("commentCount", ""),
-        "tags": "|".join(snippet.get("tags", [])),
-        "definition": content.get("definition", ""),
-        "caption": content.get("caption", ""),
-    }
-
-
-def write_to_csv(path: str, rows: List[Dict]) -> None:
-    if not rows:
-        logging.warning("没有数据需要写入 CSV。")
-        return
-
-    fieldnames = list(rows[0].keys())
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-
-    logging.info(f"已写入 CSV：{path}，共 {len(rows)} 行。")
-
-
-# ===================== 主流程 =====================
-
-def main():
-    parser = argparse.ArgumentParser(description="YouTube 元数据爬取脚本")
-    parser.add_argument(
-        "--queries_file",
-        type=str,
-        required=True,
-        help="包含搜索 query 的文本文件，每行一个"
-    )
-    parser.add_argument(
-        "--output_csv",
-        type=str,
-        default="youtube_metadata.csv",
-        help="输出 CSV 文件路径"
-    )
-    parser.add_argument(
-        "--max_per_query",
-        type=int,
-        default=200,
-        help="每个 query 最多抓取多少个视频（默认 200）"
-    )
-    parser.add_argument(
-        "--video_duration",
-        type=str,
-        default="long",
-        choices=["any", "short", "medium", "long"],
-        help="过滤视频时长（short<4min, medium 4-20min, long>20min）"
-    )
-    parser.add_argument(
-        "--region_code",
-        type=str,
-        default=None,
-        help="可选：区域代码，如 US, JP, GB，用于限制搜索区域"
-    )
-    parser.add_argument(
-        "--log_level",
-        type=str,
-        default="INFO",
-        help="日志等级: DEBUG / INFO / WARNING / ERROR"
-    )
-    args = parser.parse_args()
-
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="[%(asctime)s] [%(levelname)s] %(message)s",
-    )
-
-    api_key = get_api_key()
-    queries = load_queries_from_file(args.queries_file)
-    logging.info(f"加载 {len(queries)} 个查询语句。")
-
-    all_video_ids: Set[str] = set()
-    all_flat_rows: List[Dict] = []
-
-    for q in queries:
-        # 1) 调用 search.list 获取 videoId 列表
-        video_ids = youtube_search_query(
-            api_key=api_key,
-            query=q,
-            max_results=args.max_per_query,
-            video_duration=args.video_duration,
-            region_code=args.region_code,
+        return self._request(
+            "search",
+            params=params,
+            quota_cost=SEARCH_QUOTA_COST,
+            desc=f"search.list (channel) kw='{keyword}'",
         )
 
-        # 去重：只保留没有出现过的 videoId
-        new_ids = [vid for vid in video_ids if vid not in all_video_ids]
-        if not new_ids:
-            logging.info(f"查询 '{q}' 没有新的 videoId（全被去重了）。")
-            continue
+    def search_videos(
+        self,
+        keyword: str,
+        max_results: int = 50,
+        page_token: Optional[str] = None,
+        order: str = "relevance",
+    ) -> Optional[Dict]:
+        """
+        search.list 搜索视频（type=video），可用于扩展挖掘更多频道。
+        """
+        params = {
+            "part": "snippet",
+            "q": keyword,
+            "type": "video",
+            "maxResults": str(max_results),
+            "order": order,
+        }
+        if page_token:
+            params["pageToken"] = page_token
 
-        logging.info(f"查询 '{q}' 新增 videoId 数量：{len(new_ids)}")
-        all_video_ids.update(new_ids)
+        return self._request(
+            "search",
+            params=params,
+            quota_cost=SEARCH_QUOTA_COST,
+            desc=f"search.list (video) kw='{keyword}'",
+        )
 
-        # 2) 调用 videos.list 拉取详细 meta
-        items = youtube_get_videos_details(api_key, new_ids)
-        logging.info(f"videos.list 返回 {len(items)} 条。")
+    def channels_list(
+        self,
+        channel_ids: List[str],
+        parts: str = "snippet,statistics",
+    ) -> Optional[Dict]:
+        """
+        channels.list 查询频道详情（可选，用于质量过滤）。
+        一次最多 50 个 ID。
+        """
+        if not channel_ids:
+            return None
+        params = {"part": parts, "id": ",".join(channel_ids)}
+        return self._request(
+            "channels",
+            params=params,
+            quota_cost=CHANNELS_LIST_QUOTA_COST,
+            desc=f"channels.list ({len(channel_ids)} ids)",
+        )
 
-        # 3) 扁平化存成行
+
+class ChannelCollector:
+    """
+    根据一组关键词，用 YouTubeAPI 尽量挖掘更多频道 ID。
+    """
+
+    def __init__(
+        self,
+        api: YouTubeAPI,
+        max_pages_per_keyword: int = 3,
+        new_ratio_threshold: float = 0.6,
+        use_video_search_for_high_yield_keywords: bool = False,
+        high_yield_min_new_ratio: float = 0.8,
+    ):
+        self.api = api
+        self.max_pages_per_keyword = max_pages_per_keyword
+        self.new_ratio_threshold = new_ratio_threshold
+        self.use_video_search_for_high_yield_keywords = (
+            use_video_search_for_high_yield_keywords
+        )
+        self.high_yield_min_new_ratio = high_yield_min_new_ratio
+
+        self.seen_channels: Set[str] = set()
+
+    # ---------- 工具函数 ----------
+
+    def _extract_channel_ids_from_search_items(
+        self, items: List[Dict], source: str
+    ) -> Tuple[Set[str], int]:
+        """
+        从 search.list 返回的 items 中提取 channelId。
+
+        :param items: API 返回的 "items"
+        :param source: 日志用字符串，表明来源（channel_search/video_search）
+        :return: (新出现的 channelId 集合, 总返回条数)
+        """
+        new_ids: Set[str] = set()
+        total_count = 0
+
         for item in items:
-            row = flatten_video_item(item)
-            all_flat_rows.append(row)
+            total_count += 1
+            channel_id = None
 
-    # 4) 写入 CSV
-    write_to_csv(args.output_csv, all_flat_rows)
-    logging.info("任务完成。")
+            if source == "channel_search":
+                # type=channel 时，id 下就是 channelId
+                channel_id = (
+                    item.get("id", {}).get("channelId")
+                    or item.get("snippet", {}).get("channelId")
+                )
+            elif source == "video_search":
+                # type=video 时，snippet 里有 channelId
+                channel_id = item.get("snippet", {}).get("channelId")
+
+            if not channel_id:
+                continue
+
+            if channel_id not in self.seen_channels:
+                new_ids.add(channel_id)
+
+        return new_ids, total_count
+
+    # ---------- 核心逻辑：处理一个关键词 ----------
+
+    def process_keyword(self, keyword: str) -> Dict[str, float]:
+        """
+        对单个关键词执行：
+        - search.list(type=channel) 主流程
+        - 自适应翻页
+        - （可选）对高收益关键词再执行 search.list(type=video)
+
+        返回一些统计信息，便于日志记录和调优。
+        """
+        logging.info("Processing keyword: %s", keyword)
+
+        total_new_channels = 0
+        total_returned_items = 0
+        pages_used = 0
+
+        page_token: Optional[str] = None
+        high_yield = False
+
+        # --- 1) 主流程：type=channel ---
+
+        while pages_used < self.max_pages_per_keyword:
+            data = self.api.search_channels(
+                keyword=keyword, max_results=50, page_token=page_token
+            )
+            if data is None:
+                logging.warning("No data returned for keyword='%s', stop.", keyword)
+                break
+
+            items = data.get("items", [])
+            if not items:
+                logging.info(
+                    "No items returned for keyword='%s' (page %d), stop.",
+                    keyword,
+                    pages_used + 1,
+                )
+                break
+
+            new_ids, total_count = self._extract_channel_ids_from_search_items(
+                items, source="channel_search"
+            )
+
+            # 统计
+            pages_used += 1
+            total_returned_items += total_count
+
+            # 加入全局集合
+            self.seen_channels.update(new_ids)
+            total_new_channels += len(new_ids)
+
+            # 计算 new_ratio
+            new_ratio = len(new_ids) / total_count if total_count > 0 else 0.0
+
+            logging.info(
+                "[kw='%s'] page=%d channel_search: total=%d, new=%d, new_ratio=%.2f, global_channels=%d, quota_remaining=%d",
+                keyword,
+                pages_used,
+                total_count,
+                len(new_ids),
+                new_ratio,
+                len(self.seen_channels),
+                self.api.quota.remaining,
+            )
+
+            # 判断是否高收益关键词（为后续 video_search 做准备）
+            # 在 mock 数据中，ratio 通常很高，所以容易触发高收益逻辑
+            if new_ratio >= self.high_yield_min_new_ratio and len(new_ids) >= 10:
+                high_yield = True
+
+            # 决定是否继续翻页
+            next_token = data.get("nextPageToken")
+            if (
+                not next_token
+                or new_ratio < self.new_ratio_threshold
+                or self.api.quota.remaining < SEARCH_QUOTA_COST
+            ):
+                break
+
+            page_token = next_token
+
+        # --- 2) 可选扩展：对高收益关键词用 type=video 再挖一次 ---
+
+        if (
+            self.use_video_search_for_high_yield_keywords
+            and high_yield
+            and self.api.quota.remaining >= SEARCH_QUOTA_COST
+        ):
+            logging.info(
+                "Keyword '%s' is high-yield, performing one video_search to mine extra channels.",
+                keyword,
+            )
+            data_v = self.api.search_videos(keyword=keyword, max_results=50)
+            if data_v:
+                items_v = data_v.get("items", [])
+                if items_v:
+                    new_ids_v, total_count_v = (
+                        self._extract_channel_ids_from_search_items(
+                            items_v, source="video_search"
+                        )
+                    )
+                    # 注意：video_search 可能再次产生“新频道”
+                    self.seen_channels.update(new_ids_v)
+                    total_new_channels += len(new_ids_v)
+                    total_returned_items += total_count_v
+
+                    logging.info(
+                        "[kw='%s'] video_search: total=%d, new=%d, global_channels=%d, quota_remaining=%d",
+                        keyword,
+                        total_count_v,
+                        len(new_ids_v),
+                        len(self.seen_channels),
+                        self.api.quota.remaining,
+                    )
+
+        result = {
+            "keyword": keyword,
+            "pages_used": pages_used,
+            "total_returned_items": float(total_returned_items),
+            "total_new_channels": float(total_new_channels),
+            "avg_new_ratio": (
+                (total_new_channels / total_returned_items)
+                if total_returned_items > 0
+                else 0.0
+            ),
+        }
+        return result
+
+
+# ---------- 一些辅助函数 ----------
+
+
+def read_keywords_from_file(path: str) -> List[str]:
+    """从 txt 文件读取关键词，一行一个，去除空行，做一次简单去重，保留顺序。"""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Keywords file not found: {path}")
+
+    seen = set()
+    keywords: List[str] = []
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            kw = line.strip()
+            if not kw:
+                continue
+            if kw in seen:
+                continue
+            seen.add(kw)
+            keywords.append(kw)
+
+    return keywords
+
+
+def write_channels_to_file(path: str, channel_ids: Iterable[str]) -> None:
+    """将频道 ID 写到 txt 文件中，每行一个。"""
+    with open(path, "w", encoding="utf-8") as f:
+        for cid in sorted(channel_ids):
+            f.write(cid + "\n")
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Scrape YouTube channel IDs from a keyword list using YouTube Data API v3.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help="YouTube Data API Key。如果省略，将尝试读取环境变量 YT_API_KEY。在 --dry-run 模式下可以是任意字符串。",
+    )
+
+    parser.add_argument(
+        "--keywords",
+        type=str,
+        required=True,
+        help="关键词列表 txt 文件路径（每行一个关键词）。",
+    )
+
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="channel_list.txt",
+        help="输频道列表 txt 文件路径（每行一个 channelId）。",
+    )
+
+    parser.add_argument(
+        "--daily-quota",
+        type=int,
+        default=9000,
+        help="本次脚本可使用的 quota 预算（为了安全，不建议设为 10000 的满值）。",
+    )
+
+    parser.add_argument(
+        "--max-pages-per-keyword",
+        type=int,
+        default=3,
+        help="每个关键词最多翻几页 search.list(type=channel)。",
+    )
+
+    parser.add_argument(
+        "--new-ratio-threshold",
+        type=float,
+        default=0.6,
+        help="当某一页的新频道比例低于此阈值时，不再为该关键词继续翻页。",
+    )
+
+    parser.add_argument(
+        "--use-video-search",
+        action="store_true",
+        help="对高收益关键词额外执行一次 search.list(type=video)，从视频结果中再挖一些频道。",
+    )
+
+    parser.add_argument(
+        "--high-yield-min-new-ratio",
+        type=float,
+        default=0.8,
+        help="将关键词视为“收益”的 new_ratio 下限，仅在 --use-video-search 打开时有效。",
+    )
+
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="启用干跑模式：不真正调用 API，不消耗真实 Quota，使用模拟数据进行测试。",
+    )
+
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="日志等级。",
+    )
+
+    parser.add_argument(
+        "--http-timeout",
+        type=int,
+        default=10,
+        help="HTTP 请求超时时间（秒）。",
+    )
+
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=3,
+        help="请求失败时的最大重试次数。",
+    )
+
+    parser.add_argument(
+        "--retry-backoff",
+        type=float,
+        default=1.5,
+        help="重试退避系数（指数型 backoff 的倍数）。",
+    )
+
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+
+    # 设置日志
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+
+    # 获取 API Key
+    api_key = args.api_key or os.environ.get("YT_API_KEY")
+    
+    # 如果是 Dry Run，允许没有 API Key
+    if args.dry_run:
+        logging.info("Running in DRY-RUN mode. No actual API calls will be made.")
+        if not api_key:
+            api_key = "DUMMY_KEY_FOR_DRY_RUN"
+    
+    if not api_key:
+        logging.error(
+            "No API key provided. Use --api-key or set environment variable YT_API_KEY."
+        )
+        return 1
+
+    # 读取关键词
+    try:
+        keywords = read_keywords_from_file(args.keywords)
+    except Exception as e:
+        logging.error("Failed to read keywords file: %s", e)
+        return 1
+
+    if not keywords:
+        logging.error("No keywords found in file: %s", args.keywords)
+        return 1
+
+    logging.info("Loaded %d unique keywords from %s", len(keywords), args.keywords)
+
+    # 初始化 YouTube API 客户端
+    quota_manager = QuotaManager(daily_quota=args.daily_quota)
+    yt_api = YouTubeAPI(
+        api_key=api_key,
+        quota_manager=quota_manager,
+        http_timeout=args.http_timeout,
+        max_retries=args.max_retries,
+        retry_backoff=args.retry_backoff,
+        dry_run=args.dry_run,
+    )
+
+    collector = ChannelCollector(
+        api=yt_api,
+        max_pages_per_keyword=args.max_pages_per_keyword,
+        new_ratio_threshold=args.new_ratio_threshold,
+        use_video_search_for_high_yield_keywords=args.use_video_search,
+        high_yield_min_new_ratio=args.high_yield_min_new_ratio,
+    )
+
+    # 主循环：遍历关键词
+    for idx, kw in enumerate(keywords, start=1):
+        if quota_manager.remaining < SEARCH_QUOTA_COST:
+            logging.warning(
+                "Quota almost exhausted, stop processing further keywords. "
+                "Processed %d/%d keywords.",
+                idx - 1,
+                len(keywords),
+            )
+            break
+
+        logging.info(
+            "===== [%d/%d] Keyword: %s | Remaining quota: %d =====",
+            idx,
+            len(keywords),
+            kw,
+            quota_manager.remaining,
+        )
+
+        stats = collector.process_keyword(kw)
+        logging.info(
+            "Keyword '%s' stats: pages_used=%d, total_returned_items=%d, "
+            "total_new_channels=%d, avg_new_ratio=%.2f",
+            stats["keyword"],
+            int(stats["pages_used"]),
+            int(stats["total_returned_items"]),
+            int(stats["total_new_channels"]),
+            stats["avg_new_ratio"],
+        )
+
+    # 输出频道列表
+    write_channels_to_file(args.output, collector.seen_channels)
+    logging.info(
+        "Finished. Total unique channels: %d. Output written to %s. Quota remaining: %d.",
+        len(collector.seen_channels),
+        args.output,
+        quota_manager.remaining,
+    )
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
-
+    sys.exit(main())

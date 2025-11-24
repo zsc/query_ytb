@@ -563,7 +563,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-pages-per-keyword",
         type=int,
-        default=3,
+        default=20,
         help="每个关键词最多翻几页 search.list(type=channel)。",
     )
 

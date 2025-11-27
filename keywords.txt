@@ -4,3 +4,5 @@ bike tour 4k
 city walk 4k
 hike 4k
 jog 4k
+house tour
+trail 4k

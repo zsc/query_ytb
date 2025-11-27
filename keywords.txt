@@ -6,3 +6,4 @@ hike 4k
 jog 4k
 house tour
 trail 4k
+campus tour
